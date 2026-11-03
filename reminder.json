@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "intervalSeconds": 600,
+  "message": "시간이 토큰보다 중요합니다. 시간당 생산성과 관련된 수칙을 유념하세요.",
+  "busyOnly": true,
+  "skipWhenPending": true,
+  "includeClock": true,
+  "includeContext": true,
+  "includeModel": false,
+  "statusLine": false,
+  "notify": false
+}
