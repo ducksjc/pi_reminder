@@ -1,2 +1,10 @@
 /handoff.md
 /pi_reminder.zip
+
+# 에이전트용 문서 (사용자 문서 README.md 만 추적)
+/AGENTS.md
+/DESIGN.md
+/PITFALLS.md
+/TESTING.md
+/REVIEW.md
+/audit/
