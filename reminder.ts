@@ -4,14 +4,14 @@
  * 매 intervalSeconds 초마다 현재 시각(연월일 시분초), 컨텍스트 용량(예: 100k/1M (10%)),
  * 그리고 사용자가 reminder.json 에 적어둔 메세지를 세션에 주입한다.
  *
- * 기본 전달 방식은 "context" 모드다 — 툴콜 루프 안에서만 주입하고, 런이 끝나가면 주입하지 않는다:
- *   tick → 바로 보내지 않고 pending 슬롯에만 넣는다
- *   turn_end 핸들러 → 그 턴의 어시스턴트가 툴콜을 보유했으면(=런이 계속됨) boundary entries 로 붙인다
- *                   (continue 는 붙이지 않는다)
- *   그 턴에 툴콜이 없으면(=런이 완전히 끝나가는 지점) → 주입하지 않고 pending 을 버린다
- *   agent_settled → 남은 pending 은 버린다 (오래된 리마인더가 다음 런으로 새지 않도록)
- * 즉 "턴을 완전히 종료하는 행위"와 동시에 리마인더가 뜨는 일은 없다. 유휴 상태에서도 보내지 않는다.
+ * 기본 전달 방식은 "context" 모드다 — pi 에게 { triggerTurn: false } 로 넘기고 pi 가 알아서 턴 경계에 붙인다:
+ *   tick → pi.sendMessage(draft, { triggerTurn: false })
+ *   런 중(streaming)이면 pi 가 _pendingCustomMessages 에 넣었다가 turn_end 직후(툴콜과 그 결과가
+ *   모두 붙은 뒤) 단일 컨텍스트 엔트리로 append 한다. agent-session.js sendCustomMessage / _flushPendingCustomMessages
+ *   런이 아니면 즉시 append. 어느 쪽이든 새 모델 요청은 유발하지 않는다(실측: 요청 수 통제군과 동일).
+ *   유휴 상태에서는 busyOnly=true 이면 스킵한다.
  * role:"custom" 은 LLM 요청 직전 role:"user" 로 변환되므로 모델은 그대로 본다 (messages.js convertToLlm).
+ * 한 턴 안에 tick 이 여러 개 걸려도 중복 주입은 없다: flush 되기 전까지 다음 tick 을 건너뛴다(queuedDraft).
  * 강제로 지금 띄우려면 /reminder now (이 경우에만 pi.sendMessage(msg, { triggerTurn: false }) 로 즉시 기록).
  *
  * 설정 파일: 워크스페이스(세션 cwd)의 reminder.json
@@ -169,8 +169,8 @@ let sessionOverride: Partial<ReminderConfig> = {};
 let lastSentAt: Date | undefined;
 let lastText = "";
 let lastMode: ReminderMode | undefined;
-/** tick 이 만든 대기 슬롯. turn_end(툴콜 있음) 에서만 소진되고, 그 외에는 버려진다. */
-let pendingDraft: ReturnType<typeof makeDraft> | undefined;
+/** pi 에 넘겼고 아직 flush 되지 않은 엔트리. turn_end / agent_settled 에서 clear 된다 (한 턴에 하나만). */
+let queuedDraft: ReturnType<typeof makeDraft> | undefined;
 let nextDueAt: number | undefined;
 
 function ctx_notify(msg: string) {
@@ -248,7 +248,7 @@ function sendNow(ctx: ExtensionContext, cfg: ReminderConfig, force = false): str
 	lastText = text;
 	lastSentAt = new Date();
 	lastMode = cfg.mode;
-	if (cfg.mode === "context") return force ? flushNow(text, cfg) : armPending(text, cfg, busy);
+	if (cfg.mode === "context") return flushNow(text, cfg, busy);
 	if (cfg.mode === "user") {
 		pi_sendUser(text);
 		return busy ? "queued as user message" : "sent (starts a turn)";
@@ -259,25 +259,22 @@ function sendNow(ctx: ExtensionContext, cfg: ReminderConfig, force = false): str
 }
 
 /**
- * tick: 바로 보내지 않고 pending 슬롯에만 넣는다.
- * 실제 주입은 turn_end 핸들러가 "툴콜 루프가 계속되는 턴"에서만 한다 — 런이 완전히 끝나가는
- * 지점(툴콜 없는 턴)에서는 주입하지 않는다.
+ * context 모드: pi 에게 triggerTurn:false 로 넘긴다.
+ * - 런 중: pi 가 turn_end 직후(툴콜/결과가 모두 붙은 경계)에 append. 새 요청 없음.
+ * - 런 아님: 즉시 append. 새 요청 없음.
+ * 이미 넘긴 엔트리가 아직 flush 되기 전이면(한 턴이 tick 보다 길 때) 중복 건너뛴다.
  */
-function armPending(text: string, cfg: ReminderConfig, busy: boolean): string {
-	if (!busy) return "idle (no run, skipped)";
-	pendingDraft = makeDraft(text, cfg);
-	return "armed for the next tool-loop boundary";
-}
-
-/** /reminder now 전용: 지금 즉시 컨텍스트 엔트로 기록 (그래도 새 턴은 만들지 않음). */
-function flushNow(text: string, cfg: ReminderConfig): string {
+function flushNow(text: string, cfg: ReminderConfig, busy: boolean): string {
+	if (queuedDraft) return "already queued this turn (skipped)";
+	const draft = makeDraft(text, cfg);
 	try {
-		piApi.sendMessage(makeDraft(text, cfg), { triggerTurn: false });
+		piApi.sendMessage(draft, { triggerTurn: false });
 	} catch (err) {
 		ctx_notify(`reminder send failed: ${(err as Error).message}`);
 		return "failed";
 	}
-	return "sent now (context entry, no turn)";
+	if (busy) queuedDraft = draft;
+	return busy ? "queued for the turn boundary (no new turn)" : "appended (no turn)";
 }
 
 function makeDraft(text: string, cfg: ReminderConfig) {
@@ -362,7 +359,7 @@ function statusText(cfg: ReminderConfig): string {
 		`next: ${nextDueAt ? formatClock(new Date(nextDueAt)) : "-"}`,
 		`last sent: ${lastSentAt ? formatClock(lastSentAt) : "-"}`,
 		`last sent mode: ${lastMode ?? "-"}`,
-		`pending (armed): ${pendingDraft ? "yes — 다음 툴콜 경계에서 주입" : "no"}`,
+		`queued (not yet flushed): ${queuedDraft ? "yes — 이번 턴 경계에 붙음" : "no"}`,
 		`last text: ${lastText || "-"}`,
 		`message: ${cfg.message}`,
 	];
@@ -379,13 +376,12 @@ export default function (pi: ExtensionAPI) {
 		startTimer(ctx, effectiveConfig());
 	});
 
-	// 인터벌 카운팅은 런(턴) 시작 기준으로 다시 잡는다.
-	// 세션 시작 기준 고정 그리드로 두면, 35초 런이 10초 그리드를 가로지를 때 tick 이 4개까지 들어온다.
+	// 런 시작마다 타이머를 재앵커하면 안 된다 (11-04 실측으로 뒤집힌 지시 — README 의 "재앵커" 항목 참조).
+	// goal 모드처럼 런이 1~2 분마다 agent_start 를 다시 발생시키면 600초 그리드가 계속 뒤로 밀려
+	// 리마인더가 20~45분 동안 한 번도 뜨지 않았다. 세션 시작 기준 고정 그리드를 쓰고,
+	// 한 턴에 tick 이 여러 개 걸리는 문제는 flush 전까지 중복을 건너뛰는 것으로 막는다.
 	pi.on("agent_start", async () => {
-		if (!activeCtx) return;
-		const cfg = effectiveConfig();
-		if (!cfg.enabled || !(cfg.intervalSeconds > 0)) return;
-		startTimer(activeCtx, cfg);
+		queuedDraft = undefined;
 	});
 
 	// TUI 렌더링: pi 기본 렌더러는 [reminder] 라벨 + 빈 줄 + 패딩 박스를 그려 세로 줄을 세 개나 쓴다.
@@ -401,30 +397,14 @@ export default function (pi: ExtensionAPI) {
 			return new Text(theme.fg("customMessageText", raw), 0, 0);
 		});
 
-	// 툴콜 루프가 계속되는 턴에서만 pending 을 주입한다.
-	// 그 턴에 툴콜이 없으면 런이 완전히 끝나가는 것이므로 주입하지 않는다 (사용자 요구).
-	pi.on("turn_end", async (event) => {
-		if (!pendingDraft) return;
-		const outcome = (event as { outcome?: string }).outcome;
-		if (outcome === "aborted" || outcome === "error") {
-			pendingDraft = undefined;
-			return;
-		}
-		const content = ((event as { message?: { content?: unknown } }).message?.content ?? []) as Array<{ type?: string }>;
-		const toolCalls = content.filter((c) => c?.type === "toolCall").length;
-		if (toolCalls === 0) return; // 런 종료 직전: 아무것도 넣지 않음
-		const draft = pendingDraft;
-		pendingDraft = undefined;
-		const prevEntries = ((event as { entries?: unknown[] }).entries ?? []) as never[];
-		return {
-			entries: [...prevEntries, { type: "custom_message", customType: draft.customType, content: draft.content, display: draft.display, details: draft.details }],
-			// continue 는 붙이지 않는다 — 붙이면 턴을 이어가게 된다.
-		};
+	// pi 는 turn_end 핸들러 dispatch 직후 _pendingCustomMessages 를 flush 한다 (agent-session.js:809).
+	// 그래서 여기서 queued 를 비우면 다음 tick 이 다시 보낼 수 있다. entries 는 건드리지 않는다(반환값 없음).
+	pi.on("turn_end", async () => {
+		queuedDraft = undefined;
 	});
 
-	// 런이 완전히 settles 되면 남은 pending 은 버린다 (오래된 리마인더가 다음 런으로 새지 않음).
 	pi.on("agent_settled", async () => {
-		pendingDraft = undefined;
+		queuedDraft = undefined;
 	});
 
 	pi.on("session_shutdown", () => {

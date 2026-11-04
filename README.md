@@ -1,5 +1,9 @@
 # pi_reminder
 
+> 이 파일은 **사용자 문서**(설정 키·명령어)다. 유지보수 지식은
+> `DESIGN.md`(설계 결정과 pi 내부 근거) · `PITFALLS.md`(함정) · `TESTING.md`(검증 3단계, 카피-페이스트 스크립트) 를 볼 것.
+> `handoff.md` 는 휘발성 상태만 담는다.
+
 pi 세션에서 **매 n초마다** 아래 내용을 세션 컨텍스트에 주입하는 확장.
 
 ```
@@ -10,18 +14,19 @@ pi 세션에서 **매 n초마다** 아래 내용을 세션 컨텍스트에 주�
 - 컨텍스트 용량: `사용량/창 크기 (퍼센트)` — pi의 `ctx.getContextUsage()` 값(컴팩션/푸터와 동일한 추정치)
 - 사용자 메세지: `reminder.json` 의 `message`
 
-## 기본 동작 (context 모드) — 런이 끝나가는 지점에서는 주입하지 않는다
+## 기본 동작 (context 모드) — 11-04 단순화: pi 에게 맡기고, 새 턴만 만들지 않는다
 
-1. tick(주기 도달) → **바로 보내지 않고 pending 슬롯에만** 넣는다
-2. `turn_end` 핸들러 → 그 턴의 어시스턴트가 **툴콜을 보유했으면**(=툴콜 루프가 계속됨) boundary `entries` 로 붙인다.
-   `continue` 는 붙이지 않는다.
-3. 그 턴에 **툴콜이 없으면 = 런이 완전히 끝나가는 지점 → 주입하지 않는다**
-4. `agent_settled` → 남은 pending 은 버린다 (오래된 리마인더가 다음 런으로 새지 않음)
-5. **주기 카운팅은 런(턴) 시작 기준** — `agent_start`에서 타이머를 다시 건다. 세션 시작 기준 고정 그리드로 두면
-   10초 인터벌에서 35초 런이 tick을 4개까지 삼킨다(런 시작 0.5초 뒤에도 tick이 옴). 재앵커 후에는 런 시작 후
-   10/20/30초 시점에만 온다(최대 3회).
+1. tick(주기 도달) → `pi.sendMessage(draft, { triggerTurn: false })` **한 줄이 전부**
+2. 런 중이면 pi 가 `_pendingCustomMessages` 에 넣었다가 **turn_end 직후**(어시스턴트 툴콜과 그 툴 결과가 모두
+   붙은 경계)에 단일 컨텍스트 엔트리로 append 한다. 런이 아니면 즉시 append.
+   → 어느 쪽이든 **모델 요청은 하나도 늘지 않는다** (아래 실측).
+3. **한 턴에 tick 이 여러 개 걸려도 중복 주입은 없다**: 넘긴 엔트리가 아직 flush 되기 전까지(`queuedDraft`) 다음
+   tick 을 건너뛴다. `turn_end` / `agent_settled` / `agent_start` 에서 clear.
+4. **주기는 세션 시작 기준 고정 그리드** — `agent_start` 에서 타이머를 다시 걸지 **않는다**.
+   (11-03 에는 재앵커를 넣었으나 11-04 실조사에서 20~45분 공백의 원인으로 지목됨 — 아래 "11-04 실조사" 참조)
+5. 유휴 상태에서는 `busyOnly: true` 면 스킵한다. 그래서 런이 시작하면 다음 그리드 지점(≤ 주기)에 첫 리마인더가 온다.
 
-그래서 "턴을 완전히 종료하는 행위"와 동시에 리마인더가 뜨는 일은 없다. 유휴 상태에서도 보내지 않는다.
+즉 리마인더는 **주기마다 정확히** 뜨고, 턴 경계에 붙지만, **새 턴을 강제로 시작하지는 않는다**.
 `role:"custom"` 은 LLM 요청 직전 `role:"user"` 로 변환되므로 모델은 그대로 본다(`dist/core/messages.js` convertToLlm).
 `display: true` 면 TUI에 **본문 한 줄로** 표시된다 (pi 기본 렌더러의 `[reminder]` 라벨·빈 줄·보라색 박스는 쓰지
 않는다 — 세로 줄 낭비 때문에 확장이 자체 렌더러를 등록한다). 강제로 지금 띄우려면 `/reminder now`.
@@ -29,9 +34,20 @@ pi 세션에서 **매 n초마다** 아래 내용을 세션 컨텍스트에 주�
 ### 실측 (세션 jsonl, `P`=reminder 엔트리, `A:`=어시스턴트=모델 요청)
 
 ```
-U A:toolUse1 T P A:stop0      assistant=2  reminderEntry=1   → 마지막 어시스턴트 뒤에 엔트리 없음 ✅
+# 11-04, 인터벌 5초, 읽기 12회 런
+T U A T P A T A T P A T A T A T A T P A T A     assistant=13  reminder=3
+# 통제군과 요청 수 동일 (읽기 12 + 마지막 DONE = 13). 리마인더 3개는 툴 결과 뒤 경계에 붙음.
+# 5초×50초 런에서 tick 10개 중 주입은 3개 — 한 턴에 하나는 규칙이 중복을 막았다.
 ```
-3초 주기였지만 툴콜 경계가 1번이라 주입도 1번. 나머지 tick들은 런 종료 지점에 걸려 폐기됐다.
+
+### 11-04 실조사: 이전 구현에서 10분이 아니라 20~45분마다 떴던 이유 (innotant 세션 12시간, 67회 주입)
+
+| 원인 | 메커니즘 | 실측 |
+|---|---|---|
+| `agent_start` 재앵커 | goal 모드처럼 런이 1~2분마다 다시 시작되면 600초 그리드가 계속 뒤로 밀려 tick 이 아예 안 온다 | 세션 `20-26-45`: 21:17 → 22:02 **45분 공백**. goal-continuation 이 21:23~21:52 에 20회, 마지막 것(21:52:13) +600s = 22:02:13 에 정확히 주입 |
+| "툴콜 없는 턴에서는 폐기" 규칙 | tick 이 런 종료 턴에 걸리면 폐기되고 다음 그리드까지 +10분 | 세션 `12-46-58` 21분, `14-04-34` 20분 공백 |
+
+공백 없는 구간(단일 롱런)은 간격이 563~664초로 정상이었다.
 
 ### 참고: pi의 전달 방식 함정 (과거 구현이 여기서 막혔음)
 
@@ -39,7 +55,8 @@ U A:toolUse1 T P A:stop0      assistant=2  reminderEntry=1   → 마지막 어�
 pi 의 `sendCustomMessage` 분기 `isStreaming && options?.triggerTurn !== false` 가 참이 되어 **steer로 취급**되고,
 런 종료 시 `agent.hasQueuedMessages()` = true 가 되어 **모델 요청이 하나 더 늘어난다**
 (실측: 옵션 생략 `U A T A P A` = 요청 3 / `triggerTurn:false` `U A T A P` = 요청 2).
-현재 기본 경로는 이 경로를 타지 않고 `turn_end` boundary entries 를 쓴다. `/reminder now` 만 이 경로를 쓴다.
+11-04 단순화 이후 **기본 경로가 바로 이 경로다** (`triggerTurn: false`). 확장이 `turn_end` boundary 에 반환하는
+것은 아무것도 없다(핸들러는 `queuedDraft` 플래그만 clear 한다).
 
 ## 파일
 
@@ -78,7 +95,7 @@ pi 의 `sendCustomMessage` 분기 `isStreaming && options?.triggerTurn !== false
 | `display` | `true` | context 모드에서 TUI에 표시할지. `false`면 모델 컨텍스트에만 들어간다 |
 | `intervalSeconds` | `600` (10분) | 주기(초). 정수 권장 (1 미만은 1초로 반올림) |
 | `message` | 위 한국어 문장 | 매 tick마다 함께 넣을 메세지 |
-| `busyOnly` | `true` | **에이전트가 작업 중일 때만** arm 한다. context 모드는 유휴 상태에서 주입하지 않으므로 기본값 그대로 두면 된다 |
+| `busyOnly` | `true` | **에이전트가 작업 중일 때만** 보낸다. 유휴 tick 은 스킵되므로 런 시작 후 다음 그리드 지점(≤ 주기)에 첫 리마인더가 온다 |
 | `skipWhenPending` | `true` | 이미 대기 중인 steering/follow-up이 있으면 이번 tick 생략 |
 | `includeClock` | `true` | 시각 포함 |
 | `includeContext` | `true` | 컨텍스트 용량 포함 |
@@ -92,8 +109,8 @@ pi 의 `sendCustomMessage` 분기 `isStreaming && options?.triggerTurn !== false
 
 ## 동작 (mode 별 전달)
 
-- `context` (기본) — 위 규칙대로 **툴콜 루프가 계속되는 `turn_end` 에서만** boundary entries 로 붙인다
-  (`continue` 없음). 런이 끝나가는 턴·유휴 상태에서는 주입하지 않는다.
+- `context` (기본) — `pi.sendMessage(draft, { triggerTurn: false })`. pi 가 런 중이면 turn_end 직후(툴콜+결과 경계)에,
+  런이 아니면 즉시 컨텍스트 엔트리로 append 한다. 새 모델 요청 없음. 유휴 시에는 `busyOnly` 가 스킵.
 - `steer` — `pi.sendUserMessage(text, { deliverAs: "steer" })`. 현재 어시스턴트 턴의 툴 호출이 끝난 뒤 다음 LLM 호출
   직전에 전달된다. 런이 이미 끝난 뒤라면 큐되어 **새 턴을 만든다**.
 - `user` — `pi.sendUserMessage(text)`. 항상 사용자 메시지로 취급된다(토큰 소모 큼).
@@ -134,11 +151,11 @@ pi --extension ./reminder.ts
 ## 검증 결과 (실측)
 
 **mock** (jiti로 확장 로드 + mock `ExtensionAPI`, pi-tui 는 alias 로 연결):
-- B 규칙 10/10: idle tick 미발생 / busy tick 은 armed 만 / toolCall 있는 `turn_end` → entries 에 붙임(`continue` 없음) /
-  toolCall 없는 `turn_end` → 미주입 / `agent_settled` 후 stale 폐기 / `/reminder now` → `{triggerTurn:false}` 즉시 기록
+- 11-04 단순화 후 7/7: idle tick 미발생 / busy tick 은 `{triggerTurn:false}` 로 send / flush 전 중복 건너뛰기 /
+  `turn_end` 후 다음 tick 재전송 / `turn_end` 는 entries 를 아무것도 반환하지 않음 / `/reminder now` → `{triggerTurn:false}` /
+  `agent_start` 는 그리드를 재앵커하지 않고 queued 플래그만 clear
 - `notifySkipped`: 유휴 tick 알림 없음 / 주입 시 알림 / `notifySkipped:true` 면 스킵도 알림
 - 한 줄 렌더: `render(400)` 결과가 **1 줄**, `[reminder]` 라벨·빈 줄·박스 없음
-- 재앵커: 인터벌 2초, 런 시작을 1.5초 지점에 발생 → 첫 arm **3514ms**(=런시작+2초). 재앵커 없으면 2000ms 지점
 
 **엔드투엔드** (`pi -p -nc`, 전역 확장 로드, `intervalSeconds: 3`):
 ```
